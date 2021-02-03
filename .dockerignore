@@ -1,0 +1,6 @@
+.git
+docs
+build
+design
+Dockerfile
+docker-compose.yml

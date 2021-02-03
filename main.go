@@ -5,27 +5,15 @@ Search engine for IPFS using Elasticsearch, RabbitMQ and Tika.
 package main
 
 import (
+	"context"
 	"fmt"
-	"github.com/ipfs-search/ipfs-search/crawler"
-	"github.com/ipfs-search/ipfs-search/indexer"
-	"github.com/ipfs-search/ipfs-search/queue"
-	"github.com/ipfs/go-ipfs-api"
-	"golang.org/x/net/context"
-	"gopkg.in/olivere/elastic.v5"
+	"github.com/ipfs-search/ipfs-search/commands"
+	"github.com/ipfs-search/ipfs-search/config"
 	"gopkg.in/urfave/cli.v1"
 	"log"
 	"os"
-	"time"
-)
-
-// TODO: Read this from configuration file.
-const (
-	ipfsApi     = "localhost:5001"
-	hashWorkers = 140
-	fileWorkers = 120
-	ipfsTimeout = 360 * time.Duration(time.Second)
-	hashWait    = time.Duration(100 * time.Millisecond)
-	fileWait    = hashWait
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -52,52 +40,95 @@ func main() {
 			Usage:   "start crawler",
 			Action:  crawl,
 		},
+		{
+			Name:    "config",
+			Aliases: []string{},
+			Usage:   "configuration",
+			Subcommands: []cli.Command{
+				{
+					Name:   "generate",
+					Usage:  "generate default configuration",
+					Action: generateConfig,
+				},
+				{
+					Name:   "check",
+					Usage:  "check configuration",
+					Action: checkConfig,
+				},
+			},
+		},
 	}
 
-	app.Run(os.Args)
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:  "config, c",
+			Usage: "Load configuration from `FILE`",
+		},
+	}
+
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func getElastic() (*elastic.Client, error) {
-	el, err := elastic.NewClient()
+func getConfig(c *cli.Context) (*config.Config, error) {
+	configFile := c.GlobalString("config")
+
+	cfg, err := config.Get(configFile)
 	if err != nil {
 		return nil, err
-	}
-	exists, err := el.IndexExists("ipfs").Do(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		// Index does not exist yet, create
-		el.CreateIndex("ipfs")
 	}
 
-	return el, nil
+	err = cfg.Check()
+	if err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func checkConfig(c *cli.Context) error {
+	_, err := getConfig(c)
+	if err != nil {
+		return cli.NewExitError(err.Error(), 1)
+	}
+
+	fmt.Println("Configuration checked.")
+
+	return nil
+}
+
+func generateConfig(c *cli.Context) error {
+	cfg := config.Default()
+
+	configFile := c.GlobalString("config")
+	if configFile == "" {
+		return cli.NewExitError("Configuration file not specified. Use the \"-c\" option.", 1)
+	}
+
+	fmt.Printf("Writing default configuration to: %s\n", configFile)
+	return cfg.Write(configFile)
 }
 
 func add(c *cli.Context) error {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Allow SIGTERM / Control-C quit through context
+	onSigTerm(cancel)
+
 	if c.NArg() != 1 {
 		return cli.NewExitError("Please supply one hash as argument.", 1)
 	}
-
 	hash := c.Args().Get(0)
+
+	cfg, err := getConfig(c)
+	if err != nil {
+		return cli.NewExitError(err.Error(), 1)
+	}
 
 	fmt.Printf("Adding hash '%s' to queue\n", hash)
 
-	ch, err := queue.NewChannel()
-	if err != nil {
-		return cli.NewExitError(err.Error(), 1)
-	}
-	defer ch.Close()
-
-	queue, err := queue.NewTaskQueue(ch, "hashes")
-	if err != nil {
-		return cli.NewExitError(err.Error(), 1)
-	}
-
-	err = queue.AddTask(map[string]interface{}{
-		"hash": hash,
-	})
-
+	err = commands.AddHash(ctx, cfg, hash)
 	if err != nil {
 		return cli.NewExitError(err.Error(), 1)
 	}
@@ -105,105 +136,45 @@ func add(c *cli.Context) error {
 	return nil
 }
 
+// onSigTerm calls f() when SIGTERM (control-C) is received
+func onSigTerm(f func()) {
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	var fail = func() {
+		<-sigChan
+		os.Exit(1)
+	}
+
+	var quit = func() {
+		<-sigChan
+
+		go fail()
+
+		fmt.Println("Received SIGTERM, quitting... One more SIGTERM and we'll abort!")
+		f()
+	}
+
+	go quit()
+}
+
 func crawl(c *cli.Context) error {
-	// For now, assume gateway running on default host:port
-	sh := shell.NewShell(ipfsApi)
+	fmt.Println("Starting worker")
 
-	// Set 1 minute timeout on IPFS requests
-	sh.SetTimeout(ipfsTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	el, err := getElastic()
+	// Allow SIGTERM / Control-C quit through context
+	onSigTerm(cancel)
+
+	cfg, err := getConfig(c)
 	if err != nil {
 		return cli.NewExitError(err.Error(), 1)
 	}
 
-	addCh, err := queue.NewChannel()
-	if err != nil {
-		return cli.NewExitError(err.Error(), 1)
-	}
-	defer addCh.Close()
-
-	hq, err := queue.NewTaskQueue(addCh, "hashes")
+	err = commands.Crawl(ctx, cfg)
 	if err != nil {
 		return cli.NewExitError(err.Error(), 1)
 	}
 
-	fq, err := queue.NewTaskQueue(addCh, "files")
-	if err != nil {
-		return cli.NewExitError(err.Error(), 1)
-	}
-
-	id := indexer.NewIndexer(el)
-
-	crawli := crawler.NewCrawler(sh, id, fq, hq)
-
-	errc := make(chan error, 1)
-
-	for i := 0; i < hashWorkers; i++ {
-		// Now create queues and channel for workers
-		ch, err := queue.NewChannel()
-		if err != nil {
-			return cli.NewExitError(err.Error(), 1)
-		}
-		defer ch.Close()
-
-		hq, err := queue.NewTaskQueue(ch, "hashes")
-		if err != nil {
-			return cli.NewExitError(err.Error(), 1)
-		}
-
-		hq.StartConsumer(func(params interface{}) error {
-			args := params.(*crawler.CrawlerArgs)
-
-			return crawli.CrawlHash(
-				args.Hash,
-				args.Name,
-				args.ParentHash,
-				args.ParentName,
-			)
-		}, &crawler.CrawlerArgs{}, errc)
-
-		// Start workers timeout/hash time apart
-		time.Sleep(hashWait)
-	}
-
-	for i := 0; i < fileWorkers; i++ {
-		ch, err := queue.NewChannel()
-		if err != nil {
-			return cli.NewExitError(err.Error(), 1)
-		}
-		defer ch.Close()
-
-		fq, err := queue.NewTaskQueue(ch, "files")
-		if err != nil {
-			return cli.NewExitError(err.Error(), 1)
-		}
-
-		fq.StartConsumer(func(params interface{}) error {
-			args := params.(*crawler.CrawlerArgs)
-
-			return crawli.CrawlFile(
-				args.Hash,
-				args.Name,
-				args.ParentHash,
-				args.ParentName,
-				args.Size,
-			)
-		}, &crawler.CrawlerArgs{}, errc)
-
-		// Start workers timeout/hash time apart
-		time.Sleep(fileWait)
-	}
-
-	// sigs := make(chan os.Signal, 1)
-	// signal.Notify(sigs, syscall.SIGQUIT)
-
-	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
-
-	for {
-		select {
-		case err = <-errc:
-			log.Printf("%T: %v", err, err)
-		}
-	}
+	return nil
 }
