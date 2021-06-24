@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"time"
 
 	"github.com/olivere/elastic/v7"
@@ -30,7 +29,6 @@ import (
 // Pool represents a pool of workers.
 type Pool struct {
 	config       *config.Config
-	httpClient   *http.Client
 	dialer       *utils.RetryingDialer
 	consumeChans struct {
 		Files       <-chan samqp.Delivery
@@ -59,8 +57,13 @@ func (w *Pool) makeCrawler(ctx context.Context) error {
 		return err
 	}
 
-	protocol := ipfs.New(w.config.IPFSConfig(), w.httpClient, w.Instrumentation)
-	extractor := tika.New(w.config.TikaConfig(), w.httpClient, protocol, w.Instrumentation)
+	// Many stat/ls connections
+	ipfsClient := utils.GetHTTPClient(w.dialer.DialContext, 1000)
+	protocol := ipfs.New(w.config.IPFSConfig(), ipfsClient, w.Instrumentation)
+
+	// Limited Tika connections (as resources are generally known to be available by now)
+	tikaClient := utils.GetHTTPClient(w.dialer.DialContext, 100)
+	extractor := tika.New(w.config.TikaConfig(), tikaClient, protocol, w.Instrumentation)
 
 	w.crawler = crawler.New(w.config.CrawlerConfig(), indexes, queues, protocol, extractor, w.Instrumentation)
 
@@ -68,10 +71,12 @@ func (w *Pool) makeCrawler(ctx context.Context) error {
 }
 
 func (w *Pool) getElasticClient() (*elastic.Client, error) {
+	httpClient := utils.GetHTTPClient(w.dialer.DialContext, 5)
+
 	return elastic.NewClient(
 		elastic.SetSniff(false),
 		elastic.SetURL(w.config.ElasticSearch.URL),
-		elastic.SetHttpClient(w.httpClient),
+		elastic.SetHttpClient(httpClient),
 	)
 }
 
@@ -256,7 +261,6 @@ func (w *Pool) init(ctx context.Context) error {
 		},
 		Context: ctx,
 	}
-	w.httpClient = utils.GetHTTPClient(w.dialer.DialContext)
 
 	log.Println("Initializing crawler.")
 	if err := w.makeCrawler(ctx); err != nil {

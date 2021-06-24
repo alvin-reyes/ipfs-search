@@ -15,20 +15,38 @@ services:
       - 9300:9300
     environment:
       - discovery.type=single-node
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      restart_policy:
+        condition: on-failure
+  kibana:
+    image: docker.elastic.co/kibana/kibana-oss:7.8.1
+    depends_on:
+      - elasticsearch
+    ports:
+      - 5601:5601
+    deploy:
+      restart_policy:
+        condition: on-failure
   ipfs:
-    image: ipfs/go-ipfs:v0.7.0
+    image: ipfs/go-ipfs:v0.8.0
     ports:
       - 4001:4001
       - 5001:5001
       - 8080:8080
-  ipfs-tika:
-    image: ipfssearch/ipfs-tika:latest
+    deploy:
+      restart_policy:
+        condition: on-failure
+  tika-extractor:
+    image: ipfssearch/tika-extractor:latest
     ports:
       - 8081:8081
     depends_on:
       - ipfs
-    environment:
-      - IPFS_GATEWAY=http://ipfs:8080/
     deploy:
       restart_policy:
         condition: on-failure
@@ -38,25 +56,30 @@ services:
       - rabbitmq
       - elasticsearch
       - ipfs
-      - ipfs-tika
+      - tika-extractor
       - jaeger
     environment:
-      - IPFS_TIKA_URL=http://ipfs-tika:8081
+      - TIKA_EXTRACTOR=http://tika-extractor:8081
       - IPFS_API_URL=http://ipfs:5001
+      - IPFS_GATEWAY_URL=http://ipfs:8080
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
       - OTEL_EXPORTER_JAEGER_ENDPOINT=http://jaeger:14268/api/traces
+      - OTEL_TRACE_SAMPLER_ARG=1.0
     deploy:
       restart_policy:
         condition: on-failure
   ipfs-search-api:
-    build: https://github.com/ipfs-search/ipfs-search-api.git#:server
+    image: ipfssearch/ipfs-search-api:latest
     ports:
       - 9615:9615
     depends_on:
       - elasticsearch
     environment:
       - ELASTICSEARCH_URL=http://elasticsearch:9200
+    deploy:
+      restart_policy:
+        condition: on-failure
   ipfs-sniffer:
     image: ipfssearch/ipfs-sniffer:latest
     depends_on:
@@ -73,6 +96,7 @@ services:
     environment:
       - SPAN_STORAGE_TYPE=elasticsearch
       - ES_SERVER_URLS=http://elasticsearch:9200
+      - ES_TAGS_AS_FIELDS_ALL=true
     depends_on:
       - elasticsearch
     ports:
